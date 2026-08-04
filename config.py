@@ -29,12 +29,12 @@ WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 PORT = int(os.getenv("PORT", "10000"))
 
 # Ссылки
-FUNPAY_URL = os.getenv("FUNPAY_URL", "https://funpay.com/")  # ссылка на твой лот
+FUNPAY_URL = os.getenv("FUNPAY_URL", "https://funpay.com/users/20786080/")
 SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/HaronVisuals")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/HaronVisuals")
 
-# Сброс HWID: не чаще, чем раз в N дней
-HWID_RESET_COOLDOWN_DAYS = int(os.getenv("HWID_RESET_COOLDOWN_DAYS", "3"))
+# Сброс HWID: не чаще, чем раз в 90 дней
+HWID_RESET_COOLDOWN_DAYS = int(os.getenv("HWID_RESET_COOLDOWN_DAYS", "90"))
 
 # Тарифы: код -> (название, дней; None = навсегда, платный ли)
 PLANS = {
