@@ -19,6 +19,7 @@ Haron Visuals Bot — @HaronVisualsBot
 
 import asyncio
 import logging
+import random
 from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -94,6 +95,17 @@ def fmt_dt(dt: datetime) -> str:
 
 def is_admin(tg_id: int) -> bool:
     return tg_id in config.ADMIN_IDS
+
+
+def get_days_for_plan(plan: str) -> int:
+    """Вернуть срок подписки в днях на основе ключа плана (из БД/конфига)."""
+    if plan == "forever":
+        return 9999
+    # Пытаемся извлечь число из ключа плана (1d, 7d, 30d, 90d и т.д.)
+    digits = ''.join(ch for ch in plan if ch.isdigit())
+    if digits:
+        return int(digits)
+    return 30
 
 
 async def sub_status_text(tg_id: int) -> str:
@@ -185,10 +197,27 @@ async def activate_key(message: Message, state: FSMContext):
     await state.clear()
     plan_name = config.PLANS[plan][0]
     sub_text = await sub_status_text(message.from_user.id)
+
+    # --- Генерация динамической кнопки для скачивания клиента ---
+    order_id = random.randint(100000, 999999)
+    days = get_days_for_plan(plan)
+    download_url = f"https://onrender.com{order_id}&days={days}"
+
+    download_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📥 Скачать клиент",
+                    url=download_url,
+                )
+            ]
+        ]
+    )
+
     await message.answer(
         f"✅ Ключ активирован!\n"
         f"🎁 Тариф: <b>{plan_name}</b>\n\n{sub_text}",
-        reply_markup=main_menu(),
+        reply_markup=download_keyboard,
     )
 
 
