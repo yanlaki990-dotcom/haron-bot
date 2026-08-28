@@ -2,19 +2,19 @@
 Haron Visuals Bot — @HaronVisualsBot
 
 Функции:
-  /start            — приветствие + главное меню (reply-клавиатура, как у Archive Visual bot)
+  /start            — приветствие + главное меню (reply-клавиатура)
   Профиль           — статус подписки, HWID, дата регистрации
-  Активировать ключ — ввод ключа HARON-XXXX-XXXX-XXXX (продаются на FunPay с автовыдачей)
+  Активировать ключ — ввод ключа HARON-XXXX-XXXX-XXXX
   Сбросить HWID     — с кулдауном
   Купить визуалы    — ссылка на лот FunPay
   Поддержка         — ссылка на тебя
 
 Админ-команды:
-  /genkeys <план> <кол-во>  — сгенерировать ключи (1d/7d/30d/90d/forever)
-  /give <tg_id> <план>      — выдать подписку вручную (конкурсы)
+  /genkeys <план> <кол-во>  — сгенерировать ключи
+  /give <tg_id> <план>      — выдать подписку вручную
   /stats                    — статистика
 
-Запуск: webhook-режим для Render (aiohttp-сервер, здоровье на "/").
+Запуск: polling (для Bothost)
 """
 
 import asyncio
@@ -35,8 +35,6 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
 
 import config
 import db
@@ -98,10 +96,9 @@ def is_admin(tg_id: int) -> bool:
 
 
 def get_days_for_plan(plan: str) -> int:
-    """Вернуть срок подписки в днях на основе ключа плана (из БД/конфига)."""
+    """Вернуть срок подписки в днях на основе ключа плана."""
     if plan == "forever":
         return 9999
-    # Пытаемся извлечь число из ключа плана (1d, 7d, 30d, 90d и т.д.)
     digits = ''.join(ch for ch in plan if ch.isdigit())
     if digits:
         return int(digits)
@@ -336,24 +333,16 @@ async def cmd_stats(message: Message):
     )
 
 
-# ---------- Запуск (webhook для Render) ----------
+# ---------- Запуск (polling для Bothost) ----------
 
-async def on_startup(bot: Bot):
+async def on_startup():
+    """Инициализация БД при старте."""
     await db.init()
-    if config.WEBHOOK_BASE_URL:
-        await bot.set_webhook(
-            config.WEBHOOK_BASE_URL + config.WEBHOOK_PATH,
-            drop_pending_updates=True,
-        )
-        log.info("Webhook set: %s", config.WEBHOOK_BASE_URL + config.WEBHOOK_PATH)
+    log.info("База данных инициализирована.")
 
 
-async def health(request: web.Request) -> web.Response:
-    """Health-check для Render и UptimeRobot."""
-    return web.Response(text="Haron Visuals Bot: OK")
-
-
-def main():
+async def main():
+    """Точка входа: запуск бота в режиме polling."""
     bot = Bot(
         token=config.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -362,14 +351,9 @@ def main():
     dp.include_router(router)
     dp.startup.register(on_startup)
 
-    app = web.Application()
-    app.router.add_get("/", health)
-
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=config.WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
-
-    web.run_app(app, host="0.0.0.0", port=config.PORT)
+    log.info("Бот запущен и ожидает сообщения...")
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
