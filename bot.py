@@ -216,7 +216,6 @@ async def process_key(message: Message, state: FSMContext):
             await state.clear()
             return
 
-    # Ключ свободен
     await state.update_data(key=key, plan=row["plan"])
     await message.answer(
         "🔑 Ключ действителен! Теперь придумайте логин для входа в игру.\n"
