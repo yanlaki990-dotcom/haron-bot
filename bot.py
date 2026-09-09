@@ -4,7 +4,7 @@ Haron Visuals Bot — @HaronVisualsBot
 Функции:
   /start            — приветствие + главное меню (reply-клавиатура)
   Профиль           — статус подписки, HWID, дата регистрации
-  Активировать ключ — ввод ключа HARON-XXXX-XXXX-XXXX
+  Активировать ключ — ввод ключа HARON-XXXX-XXXX-XXXX, затем логин/пароль для SecureFabric
   Сбросить HWID     — с кулдауном
   Купить визуалы    — ссылка на лот FunPay
   Поддержка         — ссылка на тебя
@@ -20,8 +20,10 @@ Haron Visuals Bot — @HaronVisualsBot
 import asyncio
 import logging
 import random
+import re
 from datetime import datetime, timezone
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -79,10 +81,12 @@ def support_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-# ---------- FSM для ввода ключа ----------
+# ---------- FSM для ввода ключа, логина, пароля ----------
 
 class KeyInput(StatesGroup):
     waiting_key = State()
+    waiting_username = State()
+    waiting_password = State()
 
 
 # ---------- Хелперы ----------
@@ -171,51 +175,155 @@ async def ask_key(message: Message, state: FSMContext):
 
 
 @router.message(KeyInput.waiting_key, F.text)
-async def activate_key(message: Message, state: FSMContext):
+async def process_key(message: Message, state: FSMContext):
     key = message.text.strip().upper()
-
     if not key.startswith("HARON-"):
         await message.answer(
-            "❌ Неверный формат ключа. Пример:\n"
-            "<code>HARON-AB12-CD34-EF56</code>\n\nПопробуй ещё раз или /start"
+            "❌ Неверный формат. Пример: <code>HARON-AB12-CD34-EF56</code>\nПопробуй ещё раз."
         )
         return
 
-    status, plan = await db.activate_key(key, message.from_user.id)
+    async with db.pool.acquire() as con:
+        row = await con.fetchrow("SELECT * FROM license_keys WHERE key = $1", key)
+        if row is None:
+            await message.answer("❌ Ключ не найден.")
+            return
 
-    if status == "not_found":
-        await message.answer("❌ Такого ключа не существует. Проверь и попробуй ещё раз.")
+        if row["activated_by"] is not None:
+            tg_id = row["activated_by"]
+            user = await db.get_user(tg_id)
+            vendor_username = user.get("vendor_username") if user else "неизвестно"
+            sub = await db.get_active_subscription(tg_id)
+
+            if sub:
+                if sub["expires_at"] is None:
+                    status_text = "♾ Бессрочная"
+                else:
+                    left = sub["expires_at"] - datetime.now(timezone.utc)
+                    days = left.days
+                    hours = left.seconds // 3600
+                    status_text = f"до {fmt_dt(sub['expires_at'])} (осталось {days} д. {hours} ч.)"
+                await message.answer(
+                    f"🔑 Этот ключ уже активирован пользователем <b>{vendor_username}</b>.\n"
+                    f"Статус подписки: {status_text}\n"
+                    f"Если это ваш ключ, войдите в бота с того аккаунта или обратитесь в поддержку."
+                )
+            else:
+                await message.answer(
+                    f"🔑 Этот ключ уже активирован, но активная подписка не найдена.\n"
+                    f"Возможно, она истекла. Обратитесь в поддержку."
+                )
+            await state.clear()
+            return
+
+    # Ключ свободен
+    await state.update_data(key=key, plan=row["plan"])
+    await message.answer(
+        "🔑 Ключ действителен! Теперь придумайте логин для входа в игру.\n"
+        "Логин: от 3 до 64 символов, только латиница, цифры, _ . @ + -"
+    )
+    await state.set_state(KeyInput.waiting_username)
+
+
+@router.message(KeyInput.waiting_username, F.text)
+async def process_username(message: Message, state: FSMContext):
+    username = message.text.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.@+-]{3,64}", username):
+        await message.answer(
+            "❌ Логин должен быть 3–64 символа и содержать только:\n"
+            "латиницу, цифры, _ . @ + -\nПопробуйте снова."
+        )
         return
-    if status == "used":
-        await message.answer("❌ Этот ключ уже был активирован.")
+    await state.update_data(username=username)
+    await message.answer("Теперь введите пароль (минимум 4 символа).")
+    await state.set_state(KeyInput.waiting_password)
+
+
+@router.message(KeyInput.waiting_password, F.text)
+async def process_password(message: Message, state: FSMContext):
+    password = message.text.strip()
+    if len(password) < 4:
+        await message.answer("❌ Пароль должен быть хотя бы 4 символа. Попробуйте снова.")
+        return
+
+    data = await state.get_data()
+    username = data["username"]
+    key = data["key"]
+    plan = data["plan"]
+
+    if plan == "forever":
+        payload = {
+            "username": username,
+            "password": password,
+            "lifetime": True
+        }
+    else:
+        days = get_days_for_plan(plan)
+        payload = {
+            "username": username,
+            "password": password,
+            "days": days
+        }
+
+    headers = {
+        "X-Vendor-Key": config.VENDOR_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(config.VENDOR_API_URL, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    await message.answer(
+                        f"❌ Ошибка при создании аккаунта в системе лицензирования.\n"
+                        f"Код: {resp.status}\n{error_text[:200]}\n"
+                        "Попробуйте позже или свяжитесь с поддержкой."
+                    )
+                    await state.clear()
+                    return
+                result = await resp.json()
+    except Exception as e:
+        await message.answer(f"❌ Ошибка соединения: {e}\nПовторите позже.")
         await state.clear()
         return
 
-    await state.clear()
-    plan_name = config.PLANS[plan][0]
-    sub_text = await sub_status_text(message.from_user.id)
+    if result.get("status") == "ok":
+        action = result.get("action")
+        expires_at = result.get("expiresAt")
+        if expires_at and expires_at != 0:
+            expire_date = datetime.fromtimestamp(expires_at / 1000).strftime("%d.%m.%Y %H:%M")
+        else:
+            expire_date = "бессрочно"
 
-    # --- Генерация динамической кнопки для скачивания клиента ---
-    order_id = random.randint(100000, 999999)
-    days = get_days_for_plan(plan)
-    download_url = f"https://onrender.com{order_id}&days={days}"
+        async with db.pool.acquire() as con:
+            await con.execute(
+                "UPDATE license_keys SET activated_by = $1, activated_at = now() WHERE key = $2",
+                message.from_user.id,
+                key
+            )
+        await db.grant_subscription(message.from_user.id, plan, source="key")
+        await db.set_vendor_username(message.from_user.id, username)
 
-    download_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📥 Скачать клиент",
-                    url=download_url,
-                )
-            ]
-        ]
-    )
-
-    await message.answer(
-        f"✅ Ключ активирован!\n"
-        f"🎁 Тариф: <b>{plan_name}</b>\n\n{sub_text}",
-        reply_markup=download_keyboard,
-    )
+        plan_name = config.PLANS[plan][0]
+        await message.answer(
+            f"✅ Аккаунт в SecureFabric {action}!\n\n"
+            f"👤 Логин: <code>{username}</code>\n"
+            f"🔑 Пароль: <code>{password}</code>\n"
+            f"🎁 Тариф: <b>{plan_name}</b>\n"
+            f"⏳ Действует до: {expire_date}\n\n"
+            f"📥 Скачать лаунчер: {config.LOADER_URL}\n\n"
+            "Сохраните логин и пароль — они нужны для входа в игру.",
+            reply_markup=main_menu()
+        )
+        await state.clear()
+    else:
+        error_code = result.get("code", "UNKNOWN")
+        await message.answer(
+            f"❌ SecureFabric вернул ошибку: {error_code}\n"
+            "Пожалуйста, свяжитесь с поддержкой."
+        )
+        await state.clear()
 
 
 @router.message(F.text == "💻 Сбросить HWID")
