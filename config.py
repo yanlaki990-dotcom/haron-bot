@@ -44,3 +44,9 @@ PLANS = {
     "90d": ("3 месяца", 90, True),
     "forever": ("Навсегда", None, True),
 }
+
+# SecureFabric Vendor API
+VENDOR_API_KEY = os.getenv("VENDOR_API_KEY", "")   # sf_vkey_...
+MOD_ID = "haronvisual"                             # ваш modId
+VENDOR_API_URL = "https://server.rehab/v1/vendor/subscribers"
+LOADER_URL = f"https://server.rehab/download/{MOD_ID}"
