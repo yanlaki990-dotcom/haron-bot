@@ -27,11 +27,11 @@ async def init():
         await con.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
-                tg_id       BIGINT PRIMARY KEY,
-                username    TEXT,
-                first_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                hwid        TEXT,
-                hwid_reset_at TIMESTAMPTZ
+                tg_id           BIGINT PRIMARY KEY,
+                username        TEXT,
+                first_seen      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                hwid            TEXT,
+                hwid_reset_at   TIMESTAMPTZ
             );
 
             CREATE TABLE IF NOT EXISTS subscriptions (
@@ -52,6 +52,10 @@ async def init():
                 activated_at TIMESTAMPTZ
             );
             """
+        )
+        # Добавляем колонку vendor_username, если её нет
+        await con.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_username TEXT"
         )
 
 
@@ -106,14 +110,12 @@ async def grant_subscription(tg_id: int, plan: str, source: str = "key"):
             tg_id,
         )
 
-        # Уже есть вечная — ничего делать не надо
         if current and current["expires_at"] is None:
             return current
 
         if days is None:
-            expires_at = None  # навсегда
+            expires_at = None
         else:
-            # Стакаем к текущему остатку, если он есть
             base = now
             if current and current["expires_at"] and current["expires_at"] > now:
                 base = current["expires_at"]
@@ -129,6 +131,23 @@ async def grant_subscription(tg_id: int, plan: str, source: str = "key"):
             plan,
             expires_at,
             source,
+        )
+
+
+async def get_vendor_username(tg_id: int) -> str | None:
+    async with pool.acquire() as con:
+        return await con.fetchval(
+            "SELECT vendor_username FROM users WHERE tg_id = $1",
+            tg_id
+        )
+
+
+async def set_vendor_username(tg_id: int, vendor_username: str):
+    async with pool.acquire() as con:
+        await con.execute(
+            "UPDATE users SET vendor_username = $1 WHERE tg_id = $2",
+            vendor_username,
+            tg_id
         )
 
 
@@ -156,7 +175,7 @@ async def generate_keys(plan: str, count: int, admin_id: int) -> list[str]:
                     keys.append(key)
                     break
                 except asyncpg.UniqueViolationError:
-                    continue  # коллизия ключа — генерим заново
+                    continue
     return keys
 
 
@@ -191,11 +210,6 @@ async def activate_key(key: str, tg_id: int):
 # ---------- HWID ----------
 
 async def reset_hwid(tg_id: int):
-    """
-    Сбрасывает HWID с учётом кулдауна.
-    Возвращает (status, seconds_left):
-      status: 'ok' | 'cooldown'
-    """
     now = datetime.now(timezone.utc)
     cooldown = timedelta(days=config.HWID_RESET_COOLDOWN_DAYS)
 
