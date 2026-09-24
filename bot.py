@@ -1,30 +1,16 @@
 """
 Haron Visuals Bot — @HaronVisualsBot
-
-Функции:
-  /start            — приветствие + главное меню (reply-клавиатура)
-  Профиль           — статус подписки, HWID, дата регистрации
-  Активировать ключ — ввод ключа HARON-XXXX-XXXX-XXXX, затем логин/пароль для SecureFabric
-  Сбросить HWID     — с кулдауном
-  Купить визуалы    — ссылка на лот FunPay
-  Поддержка         — ссылка на тебя
-
-Админ-команды:
-  /genkeys <план> <кол-во>  — сгенерировать ключи
-  /give <tg_id> <план>      — выдать подписку вручную
-  /stats                    — статистика
-
-Запуск: polling (для Bothost)
+...
 """
 
 import asyncio
 import logging
-import random
 import re
 from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable, Dict
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -35,6 +21,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
+    CallbackQuery,
     ReplyKeyboardMarkup,
 )
 
@@ -45,6 +32,59 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("haron-bot")
 
 router = Router()
+
+
+# ---------- Middleware для обязательной подписки ----------
+
+class SubscriptionMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
+        event: Message | CallbackQuery,
+        data: Dict[str, Any]
+    ) -> Any:
+        bot: Bot = data["bot"]
+        user_id = event.from_user.id
+
+        # Админов пропускаем без проверки
+        if user_id in config.ADMIN_IDS:
+            return await handler(event, data)
+
+        # Проверяем подписку
+        is_subscribed = False
+        try:
+            member = await bot.get_chat_member(chat_id=config.CHANNEL_ID, user_id=user_id)
+            if member.status in ['creator', 'administrator', 'member']:
+                is_subscribed = True
+        except Exception as e:
+            log.error(f"Ошибка проверки подписки для {user_id}: {e}")
+
+        # Если подписан — пропускаем дальше
+        if is_subscribed:
+            return await handler(event, data)
+
+        # Если не подписан, но это колбэк проверки
+        if isinstance(event, CallbackQuery) and event.data == "check_sub":
+            await event.answer("❌ Вы всё ещё не подписаны на канал! Пожалуйста, подпишитесь.", show_alert=True)
+            return
+
+        # Во всех остальных случаях показываем экран подписки
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Подписаться на канал", url=config.CHANNEL_URL)],
+            [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")]
+        ])
+        text = (
+            "⚠️ <b>Для использования бота необходимо подписаться на наш канал!</b>\n\n"
+            "Пожалуйста, подпишитесь и нажмите «Я подписался»."
+        )
+
+        if isinstance(event, Message):
+            await event.answer(text, reply_markup=keyboard)
+        elif isinstance(event, CallbackQuery):
+            await event.message.answer(text, reply_markup=keyboard)
+            await event.answer()
+
+        return  # Блокируем дальнейшую обработку
 
 
 # ---------- Клавиатуры ----------
@@ -58,7 +98,10 @@ def main_menu() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="💻 Сбросить HWID"),
                 KeyboardButton(text="🛒 Купить визуалы"),
             ],
-            [KeyboardButton(text="🟢 Поддержка")],
+            [
+                KeyboardButton(text="📢 Наш канал"),
+                KeyboardButton(text="🟢 Поддержка"),
+            ],
         ],
         resize_keyboard=True,
     )
@@ -81,12 +124,19 @@ def support_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-# ---------- FSM для ввода ключа, логина, пароля ----------
+def channel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Подписаться на канал", url=config.CHANNEL_URL)]
+        ]
+    )
+
+
+# ---------- FSM ----------
 
 class KeyInput(StatesGroup):
     waiting_key = State()
-    waiting_username = State()
-    waiting_password = State()
+    waiting_credentials = State()
 
 
 # ---------- Хелперы ----------
@@ -100,13 +150,10 @@ def is_admin(tg_id: int) -> bool:
 
 
 def get_days_for_plan(plan: str) -> int:
-    """Вернуть срок подписки в днях на основе ключа плана."""
     if plan == "forever":
         return 9999
     digits = ''.join(ch for ch in plan if ch.isdigit())
-    if digits:
-        return int(digits)
-    return 30
+    return int(digits) if digits else 30
 
 
 async def sub_status_text(tg_id: int) -> str:
@@ -126,6 +173,14 @@ async def sub_status_text(tg_id: int) -> str:
 
 # ---------- Пользовательские хендлеры ----------
 
+@router.callback_query(F.data == "check_sub")
+async def check_sub_callback(call: CallbackQuery, state: FSMContext):
+    # Если мы здесь, значит middleware пропустил (пользователь подписан)
+    await call.message.delete()
+    await call.message.answer("✅ Спасибо за подписку! Теперь вам доступен функционал бота.\nНажмите /start")
+    await call.answer()
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -141,7 +196,8 @@ async def cmd_start(message: Message, state: FSMContext):
             "👋 Добро пожаловать в <b>Haron Visuals</b>!\n\n"
             "Здесь ты можешь активировать ключ, управлять подпиской "
             "и HWID.\n\n"
-            "🛒 Ключи продаются на FunPay (кнопка «Купить визуалы»)."
+            "🛒 Ключи продаются на FunPay (кнопка «Купить визуалы»).\n"
+            "📢 Все новости и обновления — в нашем канале."
         )
 
     await message.answer(text, reply_markup=main_menu())
@@ -218,51 +274,48 @@ async def process_key(message: Message, state: FSMContext):
 
     await state.update_data(key=key, plan=row["plan"])
     await message.answer(
-        "🔑 Ключ действителен! Теперь придумайте логин для входа в игру.\n"
-        "Логин: от 3 до 64 символов, только латиница, цифры, _ . @ + -"
+        "🔑 Ключ действителен! Теперь введите логин и пароль одной строкой через пробел.\n"
+        "Пример: <code>mylogin mypassword</code>\n"
+        "Логин: 3–64 символа, только латиница, цифры, _ . @ + -\n"
+        "Пароль: минимум 4 символа (без пробелов)."
     )
-    await state.set_state(KeyInput.waiting_username)
+    await state.set_state(KeyInput.waiting_credentials)
 
 
-@router.message(KeyInput.waiting_username, F.text)
-async def process_username(message: Message, state: FSMContext):
-    username = message.text.strip()
-    if not re.fullmatch(r"[A-Za-z0-9_.@+-]{3,64}", username):
+@router.message(KeyInput.waiting_credentials, F.text)
+async def process_credentials(message: Message, state: FSMContext):
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) != 2:
         await message.answer(
-            "❌ Логин должен быть 3–64 символа и содержать только:\n"
-            "латиницу, цифры, _ . @ + -\nПопробуйте снова."
+            "❌ Введите логин и пароль через пробел.\n"
+            "Пример: <code>mylogin mypassword</code>"
         )
         return
-    await state.update_data(username=username)
-    await message.answer("Теперь введите пароль (минимум 4 символа).")
-    await state.set_state(KeyInput.waiting_password)
 
+    username_raw, password_raw = parts[0], parts[1]
+    username = username_raw.replace(" ", "").replace("\t", "").replace("\n", "")
+    password = password_raw.replace(" ", "").replace("\t", "").replace("\n", "")
 
-@router.message(KeyInput.waiting_password, F.text)
-async def process_password(message: Message, state: FSMContext):
-    password = message.text.strip()
+    if not username or not re.fullmatch(r"[A-Za-z0-9_.@+-]{3,64}", username):
+        await message.answer(
+            "❌ Логин не подходит. Используйте 3–64 символа:\n"
+            "латиница, цифры, _ . @ + -\nПопробуйте снова."
+        )
+        return
+
     if len(password) < 4:
-        await message.answer("❌ Пароль должен быть хотя бы 4 символа. Попробуйте снова.")
+        await message.answer("❌ Пароль должен быть минимум 4 символа (без пробелов). Попробуйте снова.")
         return
 
     data = await state.get_data()
-    username = data["username"]
     key = data["key"]
     plan = data["plan"]
 
     if plan == "forever":
-        payload = {
-            "username": username,
-            "password": password,
-            "lifetime": True
-        }
+        payload = {"username": username, "password": password, "lifetime": True}
     else:
         days = get_days_for_plan(plan)
-        payload = {
-            "username": username,
-            "password": password,
-            "days": days
-        }
+        payload = {"username": username, "password": password, "days": days}
 
     headers = {
         "X-Vendor-Key": config.VENDOR_API_KEY,
@@ -277,7 +330,7 @@ async def process_password(message: Message, state: FSMContext):
                     await message.answer(
                         f"❌ Ошибка при создании аккаунта в системе лицензирования.\n"
                         f"Код: {resp.status}\n{error_text[:200]}\n"
-                        "Попробуйте позже или свяжитесь с поддержкой."
+                        "Проверьте правильность данных или свяжитесь с поддержкой."
                     )
                     await state.clear()
                     return
@@ -357,6 +410,16 @@ async def buy(message: Message):
         "3. Вернись сюда и нажми «🔑 Активировать ключ»\n\n"
         "Тарифы: 30 дней / 3 месяца / навсегда",
         reply_markup=buy_keyboard(),
+    )
+
+
+@router.message(F.text == "📢 Наш канал")
+async def channel(message: Message):
+    await message.answer(
+        "📢 <b>Официальный канал Haron Visuals</b>\n\n"
+        "Подпишись, чтобы первым узнавать об обновлениях, "
+        "новых функциях и акциях!",
+        reply_markup=channel_keyboard(),
     )
 
 
@@ -440,21 +503,24 @@ async def cmd_stats(message: Message):
     )
 
 
-# ---------- Запуск (polling для Bothost) ----------
+# ---------- Запуск ----------
 
 async def on_startup():
-    """Инициализация БД при старте."""
     await db.init()
     log.info("База данных инициализирована.")
 
 
 async def main():
-    """Точка входа: запуск бота в режиме polling."""
     bot = Bot(
         token=config.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
+    
+    # Подключаем middleware для проверки подписки
+    dp.message.middleware(SubscriptionMiddleware())
+    dp.callback_query.middleware(SubscriptionMiddleware())
+    
     dp.include_router(router)
     dp.startup.register(on_startup)
 
