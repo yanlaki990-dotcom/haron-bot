@@ -1,6 +1,5 @@
 """Haron Visuals Bot"""
 import asyncio, json, logging, re, uuid
-import bcrypt
 from datetime import datetime, timezone
 import aiohttp
 from aiohttp import web
@@ -127,12 +126,11 @@ async def create_vendor_account(message: Message, username: str, password: str, 
         await db.grant_subscription(message.from_user.id, plan, source=source)
         await db.set_vendor_username(message.from_user.id, username)
 
-        # === НОВОЕ: сохраняем пароль в Neon (bcrypt-хеш) ===
+        # Сохраняем пароль в Neon (открытым текстом)
         try:
-            password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-            await db.set_password_hash(message.from_user.id, password_hash)
+            await db.set_password(message.from_user.id, password)
         except Exception as e:
-            log.error(f"save password_hash failed for {message.from_user.id}: {e}")
+            log.error(f"save password failed for {message.from_user.id}: {e}")
 
         await message.answer(f"✅ Аккаунт в SecureFabric создан!\n\n👤 Логин: <code>{username}</code>\n🔑 Пароль: <code>{password}</code>\n🎁 Тариф: <b>{config.PLANS[plan][0]}</b>\n⏳ До: {exp_d}\n\n📥 Скачать лаунчер: {config.LOADER_URL}\n\nСохрани логин и пароль.", reply_markup=main_menu())
         return True
