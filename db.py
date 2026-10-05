@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS payments (order_id TEXT PRIMARY KEY, tg_id BIGINT NOT
 CREATE TABLE IF NOT EXISTS promos (code TEXT PRIMARY KEY, percent INT NOT NULL, max_uses INT NOT NULL DEFAULT 0, used INT NOT NULL DEFAULT 0, active BOOL NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS pending_vendor (tg_id BIGINT PRIMARY KEY, plan TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());""")
         await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_username TEXT")
-        await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT")
+        await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password TEXT")
         await con.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS promo_code TEXT")
 
 async def upsert_user(tg_id: int, username: str | None):
@@ -32,9 +32,9 @@ async def get_user_by_username(username: str):
     async with pool.acquire() as con:
         return await con.fetchrow("SELECT * FROM users WHERE username=$1", username)
 
-async def set_password_hash(tg_id: int, password_hash: str):
+async def set_password(tg_id: int, password: str):
     async with pool.acquire() as con:
-        await con.execute("UPDATE users SET password_hash=$1 WHERE tg_id=$2", password_hash, tg_id)
+        await con.execute("UPDATE users SET password=$1 WHERE tg_id=$2", password, tg_id)
 
 async def get_active_subscription(tg_id: int):
     async with pool.acquire() as con:
