@@ -1,160 +1,88 @@
-"""
-Haron Visuals Bot — @HaronVisualsBot
-...
-"""
-
-import asyncio
-import logging
-import re
+"""Haron Visuals Bot"""
+import asyncio, json, logging, re, uuid
+import bcrypt
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict
-
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    Message,
-    CallbackQuery,
-    ReplyKeyboardMarkup,
-)
-
-import config
-import db
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, CallbackQuery, ReplyKeyboardMarkup
+import config, db, rollypay
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("haron-bot")
-
 router = Router()
 
-
-# ---------- Middleware для обязательной подписки ----------
-
 class SubscriptionMiddleware(BaseMiddleware):
-    async def __call__(
-        self,
-        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
-        event: Message | CallbackQuery,
-        data: Dict[str, Any]
-    ) -> Any:
+    async def __call__(self, handler, event, data):
         bot: Bot = data["bot"]
         user_id = event.from_user.id
-
-        # Админов пропускаем без проверки
         if user_id in config.ADMIN_IDS:
             return await handler(event, data)
-
-        # Проверяем подписку
-        is_subscribed = False
+        is_sub = False
         try:
-            member = await bot.get_chat_member(chat_id=config.CHANNEL_ID, user_id=user_id)
-            if member.status in ['creator', 'administrator', 'member']:
-                is_subscribed = True
+            m = await bot.get_chat_member(chat_id=config.CHANNEL_ID, user_id=user_id)
+            if m.status in ['creator','administrator','member']:
+                is_sub = True
         except Exception as e:
-            log.error(f"Ошибка проверки подписки для {user_id}: {e}")
-
-        # Если подписан — пропускаем дальше
-        if is_subscribed:
+            log.error(f"sub {user_id}: {e}")
+        if is_sub:
             return await handler(event, data)
-
-        # Если не подписан, но это колбэк проверки
         if isinstance(event, CallbackQuery) and event.data == "check_sub":
-            await event.answer("❌ Вы всё ещё не подписаны на канал! Пожалуйста, подпишитесь.", show_alert=True)
+            await event.answer("❌ Ты ещё не подписан!", show_alert=True)
             return
-
-        # Во всех остальных случаях показываем экран подписки
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Подписаться на канал", url=config.CHANNEL_URL)],
-            [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")]
-        ])
-        text = (
-            "⚠️ <b>Для использования бота необходимо подписаться на наш канал!</b>\n\n"
-            "Пожалуйста, подпишитесь и нажмите «Я подписался»."
-        )
-
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📢 Подписаться", url=config.CHANNEL_URL)],[InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")]])
         if isinstance(event, Message):
-            await event.answer(text, reply_markup=keyboard)
+            await event.answer("⚠️ <b>Подпишись на канал!</b>", reply_markup=kb)
         elif isinstance(event, CallbackQuery):
-            await event.message.answer(text, reply_markup=keyboard)
+            await event.message.answer("⚠️ <b>Подпишись на канал!</b>", reply_markup=kb)
             await event.answer()
+        return
 
-        return  # Блокируем дальнейшую обработку
+def main_menu():
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="👤 Профиль")],[KeyboardButton(text="🔑 Активировать ключ")],[KeyboardButton(text="💻 Сбросить HWID"),KeyboardButton(text="🛒 Купить визуалы")],[KeyboardButton(text="📢 Наш канал"),KeyboardButton(text="🟢 Поддержка")],[KeyboardButton(text="📄 Документы")]], resize_keyboard=True)
 
+def buy_tariffs_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"📅 30 Дней ({config.PRICES['30d']}р)", callback_data="buy_30d")],[InlineKeyboardButton(text=f"📅 90 Дней ({config.PRICES['90d']}р)", callback_data="buy_90d")],[InlineKeyboardButton(text=f"♾️ Навсегда ({config.PRICES['forever']}р)", callback_data="buy_forever")]])
 
-# ---------- Клавиатуры ----------
+def promo_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Нету промокода", callback_data="nopromo")]])
 
-def main_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="🔑 Активировать ключ")],
-            [
-                KeyboardButton(text="💻 Сбросить HWID"),
-                KeyboardButton(text="🛒 Купить визуалы"),
-            ],
-            [
-                KeyboardButton(text="📢 Наш канал"),
-                KeyboardButton(text="🟢 Поддержка"),
-            ],
-        ],
-        resize_keyboard=True,
-    )
+def support_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🟢 Написать в поддержку", url=config.SUPPORT_URL)]])
 
+def channel_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📢 Подписаться", url=config.CHANNEL_URL)]])
 
-def buy_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🛒 Открыть FunPay", url=config.FUNPAY_URL)],
-            [InlineKeyboardButton(text="📢 Канал", url=config.CHANNEL_URL)],
-        ]
-    )
-
-
-def support_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🟢 Написать в поддержку", url=config.SUPPORT_URL)]
-        ]
-    )
-
-
-def channel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Подписаться на канал", url=config.CHANNEL_URL)]
-        ]
-    )
-
-
-# ---------- FSM ----------
+def legal_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📄 Политика", url=config.PRIVACY_URL)],[InlineKeyboardButton(text="📜 Оферта", url=config.OFFER_URL)],[InlineKeyboardButton(text="🟢 Поддержка", url=config.SUPPORT_URL)]])
 
 class KeyInput(StatesGroup):
     waiting_key = State()
     waiting_credentials = State()
 
-
-# ---------- Хелперы ----------
+class Buy(StatesGroup):
+    waiting_promo = State()
 
 def fmt_dt(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
 
-
 def is_admin(tg_id: int) -> bool:
     return tg_id in config.ADMIN_IDS
-
 
 def get_days_for_plan(plan: str) -> int:
     if plan == "forever":
         return 9999
-    digits = ''.join(ch for ch in plan if ch.isdigit())
-    return int(digits) if digits else 30
+    d = ''.join(ch for ch in plan if ch.isdigit())
+    return int(d) if d else 30
 
+def calc_price(plan: str, percent: int = 0) -> int:
+    base = config.PRICES[plan]
+    return base if not percent else max(round(base*(100-percent)/100),1)
 
 async def sub_status_text(tg_id: int) -> str:
     sub = await db.get_active_subscription(tg_id)
@@ -163,370 +91,375 @@ async def sub_status_text(tg_id: int) -> str:
     if sub["expires_at"] is None:
         return "♾ Подписка: <b>Навсегда</b>"
     left = sub["expires_at"] - datetime.now(timezone.utc)
-    days = left.days
-    hours = left.seconds // 3600
-    return (
-        f"✅ Подписка активна до <b>{fmt_dt(sub['expires_at'])}</b>\n"
-        f"⏳ Осталось: <b>{days} д. {hours} ч.</b>"
-    )
+    return f"✅ Активна до <b>{fmt_dt(sub['expires_at'])}</b>\n⏳ Осталось: <b>{left.days} д. {left.seconds//3600} ч.</b>"
 
+async def send_invoice(chat: Message, tg_id: int, plan: str, promo_code: str | None, percent: int):
+    amount = calc_price(plan, percent)
+    order_id = f"hv_{uuid.uuid4().hex[:12]}"
+    try:
+        pay = await rollypay.create_payment(amount, order_id, f"HaronVisuals {config.PLANS[plan][0]}" + (f" promo {promo_code}" if promo_code else ""))
+    except Exception as e:
+        await chat.answer(f"❌ Касса: {e}")
+        return
+    await db.save_payment(order_id, tg_id, plan, pay.get("payment_id",""), f"{amount:.2f}", promo_code)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"💳 Оплатить {amount}р", url=pay["pay_url"])]])
+    txt = f"💳 <b>{config.PLANS[plan][0]} — {amount}р</b>"
+    if promo_code:
+        txt += f"\n🏷 <code>{promo_code}</code> (-{percent}%)"
+    await chat.answer(txt, reply_markup=kb)
 
-# ---------- Пользовательские хендлеры ----------
+async def create_vendor_account(message: Message, username: str, password: str, plan: str, source: str):
+    payload = {"username": username, "password": password, "lifetime": True} if plan=="forever" else {"username": username, "password": password, "days": get_days_for_plan(plan)}
+    headers = {"X-Vendor-Key": config.VENDOR_API_KEY, "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(config.VENDOR_API_URL, json=payload, headers=headers) as r:
+                if r.status != 200:
+                    await message.answer(f"❌ Ошибка лицензирования: {r.status}. Пиши в поддержку.")
+                    return False
+                result = await r.json()
+    except Exception as e:
+        await message.answer(f"❌ Связь: {e}")
+        return False
+    if result.get("status") == "ok":
+        exp = result.get("expiresAt")
+        exp_d = datetime.fromtimestamp(exp/1000).strftime("%d.%m.%Y %H:%M") if exp else "бессрочно"
+        await db.grant_subscription(message.from_user.id, plan, source=source)
+        await db.set_vendor_username(message.from_user.id, username)
+
+        # === НОВОЕ: сохраняем пароль в Neon (bcrypt-хеш) ===
+        try:
+            password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+            await db.set_password_hash(message.from_user.id, password_hash)
+        except Exception as e:
+            log.error(f"save password_hash failed for {message.from_user.id}: {e}")
+
+        await message.answer(f"✅ Аккаунт в SecureFabric создан!\n\n👤 Логин: <code>{username}</code>\n🔑 Пароль: <code>{password}</code>\n🎁 Тариф: <b>{config.PLANS[plan][0]}</b>\n⏳ До: {exp_d}\n\n📥 Скачать лаунчер: {config.LOADER_URL}\n\nСохрани логин и пароль.", reply_markup=main_menu())
+        return True
+    await message.answer(f"❌ SecureFabric: {result.get('code','UNKNOWN')}")
+    return False
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub_callback(call: CallbackQuery, state: FSMContext):
-    # Если мы здесь, значит middleware пропустил (пользователь подписан)
     await call.message.delete()
-    await call.message.answer("✅ Спасибо за подписку! Теперь вам доступен функционал бота.\nНажмите /start")
+    await call.message.answer("✅ Спасибо! Нажми /start")
     await call.answer()
-
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await db.upsert_user(message.from_user.id, message.from_user.username)
-
     user = await db.get_user(message.from_user.id)
-    if user and user["first_seen"] and (
-        datetime.now(timezone.utc) - user["first_seen"]
-    ).total_seconds() > 60:
+    if user and user["first_seen"] and (datetime.now(timezone.utc)-user["first_seen"]).total_seconds() > 60:
         text = "С возвращением! Вы вошли в аккаунт."
     else:
-        text = (
-            "👋 Добро пожаловать в <b>Haron Visuals</b>!\n\n"
-            "Здесь ты можешь активировать ключ, управлять подпиской "
-            "и HWID.\n\n"
-            "🛒 Ключи продаются на FunPay (кнопка «Купить визуалы»).\n"
-            "📢 Все новости и обновления — в нашем канале."
-        )
-
+        text = "👋 Добро пожаловать в <b>Haron Visuals</b>!"
     await message.answer(text, reply_markup=main_menu())
-
+    await message.answer("📄 <b>Документы:</b>", reply_markup=legal_keyboard())
 
 @router.message(F.text == "👤 Профиль")
 async def profile(message: Message):
     await db.upsert_user(message.from_user.id, message.from_user.username)
     user = await db.get_user(message.from_user.id)
-
     hwid = user["hwid"] if user and user["hwid"] else "не привязан"
     status = await sub_status_text(message.from_user.id)
-
-    await message.answer(
-        f"👤 <b>Профиль</b>\n\n"
-        f"🆔 ID: <code>{message.from_user.id}</code>\n"
-        f"📅 Регистрация: {fmt_dt(user['first_seen'])}\n"
-        f"💻 HWID: <code>{hwid}</code>\n\n"
-        f"{status}",
-        reply_markup=main_menu(),
-    )
-
+    await message.answer(f"👤 <b>Профиль</b>\n\n🆔 <code>{message.from_user.id}</code>\n📅 {fmt_dt(user['first_seen'])}\n💻 HWID: <code>{hwid}</code>\n\n{status}", reply_markup=main_menu())
 
 @router.message(F.text == "🔑 Активировать ключ")
 async def ask_key(message: Message, state: FSMContext):
     await state.set_state(KeyInput.waiting_key)
-    await message.answer(
-        "🔑 Отправь ключ в формате:\n<code>HARON-XXXX-XXXX-XXXX</code>\n\n"
-        "Для отмены — /start"
-    )
-
+    await message.answer("🔑 Отправь ключ:\n<code>HARON-XXXX-XXXX-XXXX</code>")
 
 @router.message(KeyInput.waiting_key, F.text)
 async def process_key(message: Message, state: FSMContext):
     key = message.text.strip().upper()
     if not key.startswith("HARON-"):
-        await message.answer(
-            "❌ Неверный формат. Пример: <code>HARON-AB12-CD34-EF56</code>\nПопробуй ещё раз."
-        )
+        await message.answer("❌ Формат: <code>HARON-AB12-CD34-EF56</code>")
         return
-
     async with db.pool.acquire() as con:
-        row = await con.fetchrow("SELECT * FROM license_keys WHERE key = $1", key)
+        row = await con.fetchrow("SELECT * FROM license_keys WHERE key=$1", key)
         if row is None:
             await message.answer("❌ Ключ не найден.")
             return
-
         if row["activated_by"] is not None:
-            tg_id = row["activated_by"]
-            user = await db.get_user(tg_id)
-            vendor_username = user.get("vendor_username") if user else "неизвестно"
-            sub = await db.get_active_subscription(tg_id)
-
-            if sub:
-                if sub["expires_at"] is None:
-                    status_text = "♾ Бессрочная"
-                else:
-                    left = sub["expires_at"] - datetime.now(timezone.utc)
-                    days = left.days
-                    hours = left.seconds // 3600
-                    status_text = f"до {fmt_dt(sub['expires_at'])} (осталось {days} д. {hours} ч.)"
-                await message.answer(
-                    f"🔑 Этот ключ уже активирован пользователем <b>{vendor_username}</b>.\n"
-                    f"Статус подписки: {status_text}\n"
-                    f"Если это ваш ключ, войдите в бота с того аккаунта или обратитесь в поддержку."
-                )
-            else:
-                await message.answer(
-                    f"🔑 Этот ключ уже активирован, но активная подписка не найдена.\n"
-                    f"Возможно, она истекла. Обратитесь в поддержку."
-                )
+            await message.answer("🔑 Уже активирован.")
             await state.clear()
             return
-
     await state.update_data(key=key, plan=row["plan"])
-    await message.answer(
-        "🔑 Ключ действителен! Теперь введите логин и пароль одной строкой через пробел.\n"
-        "Пример: <code>mylogin mypassword</code>\n"
-        "Логин: 3–64 символа, только латиница, цифры, _ . @ + -\n"
-        "Пароль: минимум 4 символа (без пробелов)."
-    )
+    await message.answer("Ок! Теперь логин и пароль через пробел.\nПример: <code>mylogin mypassword</code>")
     await state.set_state(KeyInput.waiting_credentials)
-
 
 @router.message(KeyInput.waiting_credentials, F.text)
 async def process_credentials(message: Message, state: FSMContext):
     parts = message.text.strip().split(maxsplit=1)
     if len(parts) != 2:
-        await message.answer(
-            "❌ Введите логин и пароль через пробел.\n"
-            "Пример: <code>mylogin mypassword</code>"
-        )
+        await message.answer("❌ Через пробел: <code>login password</code>")
         return
-
-    username_raw, password_raw = parts[0], parts[1]
-    username = username_raw.replace(" ", "").replace("\t", "").replace("\n", "")
-    password = password_raw.replace(" ", "").replace("\t", "").replace("\n", "")
-
-    if not username or not re.fullmatch(r"[A-Za-z0-9_.@+-]{3,64}", username):
-        await message.answer(
-            "❌ Логин не подходит. Используйте 3–64 символа:\n"
-            "латиница, цифры, _ . @ + -\nПопробуйте снова."
-        )
+    username, password = parts[0].replace(" ",""), parts[1].replace(" ","")
+    if not re.fullmatch(r"[A-Za-z0-9_.@+-]{3,64}", username):
+        await message.answer("❌ Логин не подходит.")
         return
-
     if len(password) < 4:
-        await message.answer("❌ Пароль должен быть минимум 4 символа (без пробелов). Попробуйте снова.")
+        await message.answer("❌ Пароль мин. 4.")
         return
-
     data = await state.get_data()
-    key = data["key"]
-    plan = data["plan"]
-
-    if plan == "forever":
-        payload = {"username": username, "password": password, "lifetime": True}
-    else:
-        days = get_days_for_plan(plan)
-        payload = {"username": username, "password": password, "days": days}
-
-    headers = {
-        "X-Vendor-Key": config.VENDOR_API_KEY,
-        "Content-Type": "application/json"
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(config.VENDOR_API_URL, json=payload, headers=headers) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    await message.answer(
-                        f"❌ Ошибка при создании аккаунта в системе лицензирования.\n"
-                        f"Код: {resp.status}\n{error_text[:200]}\n"
-                        "Проверьте правильность данных или свяжитесь с поддержкой."
-                    )
-                    await state.clear()
-                    return
-                result = await resp.json()
-    except Exception as e:
-        await message.answer(f"❌ Ошибка соединения: {e}\nПовторите позже.")
+    key, plan = data["key"], data["plan"]
+    ok = await create_vendor_account(message, username, password, plan, "key")
+    if not ok:
         await state.clear()
         return
-
-    if result.get("status") == "ok":
-        action = result.get("action")
-        expires_at = result.get("expiresAt")
-        if expires_at and expires_at != 0:
-            expire_date = datetime.fromtimestamp(expires_at / 1000).strftime("%d.%m.%Y %H:%M")
-        else:
-            expire_date = "бессрочно"
-
-        async with db.pool.acquire() as con:
-            await con.execute(
-                "UPDATE license_keys SET activated_by = $1, activated_at = now() WHERE key = $2",
-                message.from_user.id,
-                key
-            )
-        await db.grant_subscription(message.from_user.id, plan, source="key")
-        await db.set_vendor_username(message.from_user.id, username)
-
-        plan_name = config.PLANS[plan][0]
-        await message.answer(
-            f"✅ Аккаунт в SecureFabric {action}!\n\n"
-            f"👤 Логин: <code>{username}</code>\n"
-            f"🔑 Пароль: <code>{password}</code>\n"
-            f"🎁 Тариф: <b>{plan_name}</b>\n"
-            f"⏳ Действует до: {expire_date}\n\n"
-            f"📥 Скачать лаунчер: {config.LOADER_URL}\n\n"
-            "Сохраните логин и пароль — они нужны для входа в игру.",
-            reply_markup=main_menu()
-        )
-        await state.clear()
-    else:
-        error_code = result.get("code", "UNKNOWN")
-        await message.answer(
-            f"❌ SecureFabric вернул ошибку: {error_code}\n"
-            "Пожалуйста, свяжитесь с поддержкой."
-        )
-        await state.clear()
-
+    async with db.pool.acquire() as con:
+        await con.execute("UPDATE license_keys SET activated_by=$1, activated_at=now() WHERE key=$2", message.from_user.id, key)
+    await state.clear()
 
 @router.message(F.text == "💻 Сбросить HWID")
 async def reset_hwid(message: Message):
     sub = await db.get_active_subscription(message.from_user.id)
     if sub is None:
-        await message.answer("❌ Сброс HWID доступен только с активной подпиской.")
+        await message.answer("❌ Только с подпиской.")
         return
-
-    status, seconds_left = await db.reset_hwid(message.from_user.id)
-    if status == "cooldown":
-        hours = seconds_left // 3600
-        await message.answer(
-            f"⏳ Сбрасывать HWID можно раз в "
-            f"{config.HWID_RESET_COOLDOWN_DAYS} дн.\n"
-            f"Следующий сброс через: <b>{hours // 24} д. {hours % 24} ч.</b>"
-        )
+    st, sec = await db.reset_hwid(message.from_user.id)
+    if st == "cooldown":
+        await message.answer(f"⏳ Через {sec//3600} ч.")
         return
-
-    await message.answer(
-        "✅ HWID сброшен. При следующем запуске клиента "
-        "привяжется новое железо."
-    )
-
+    await message.answer("✅ HWID сброшен.")
 
 @router.message(F.text == "🛒 Купить визуалы")
-async def buy(message: Message):
-    await message.answer(
-        "🛒 <b>Покупка Haron Visuals</b>\n\n"
-        "1. Открой лот на FunPay\n"
-        "2. Оплати — ключ придёт автоматически (автовыдача)\n"
-        "3. Вернись сюда и нажми «🔑 Активировать ключ»\n\n"
-        "Тарифы: 30 дней / 3 месяца / навсегда",
-        reply_markup=buy_keyboard(),
-    )
+async def buy(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Выберите длительность подписки.", reply_markup=buy_tariffs_keyboard())
 
+@router.callback_query(F.data.startswith("buy_"))
+async def buy_tariff(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    plan = call.data.replace("buy_", "")
+    if plan not in config.PRICES:
+        return
+    await state.update_data(plan=plan)
+    await state.set_state(Buy.waiting_promo)
+    await call.message.answer("Если у вас есть промокод, то введите его:", reply_markup=promo_keyboard())
+
+@router.callback_query(F.data == "nopromo", Buy.waiting_promo)
+async def no_promo(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    data = await state.get_data()
+    plan = data.get("plan")
+    if plan not in config.PRICES:
+        await state.clear()
+        return
+    await state.clear()
+    await send_invoice(call.message, call.from_user.id, plan, None, 0)
+
+@router.message(Buy.waiting_promo, F.text)
+async def apply_promo(message: Message, state: FSMContext):
+    if message.text in ("🛒 Купить визуалы","👤 Профиль","🔑 Активировать ключ","💻 Сбросить HWID","📢 Наш канал","🟢 Поддержка","📄 Документы","/start"):
+        await state.clear()
+        return
+    data = await state.get_data()
+    plan = data.get("plan")
+    if plan not in config.PRICES:
+        await state.clear()
+        return
+    code = message.text.strip().upper()
+    if code in ("НЕТУ ПРОМОКОДА","НЕТ ПРОМОКОДА","БЕЗ ПРОМО"):
+        await state.clear()
+        await send_invoice(message, message.from_user.id, plan, None, 0)
+        return
+    promo = await db.get_promo(code)
+    if promo is None or not promo["active"]:
+        await message.answer("❌ Нет такого. Ещё раз или жми «Нету промокода».")
+        return
+    if promo["max_uses"] and promo["used"] >= promo["max_uses"]:
+        await message.answer("❌ Промокод закончился.")
+        return
+    await state.clear()
+    await message.answer(f"✅ Промокод применён (-{promo['percent']}%).")
+    await send_invoice(message, message.from_user.id, plan, promo["code"], promo["percent"])
 
 @router.message(F.text == "📢 Наш канал")
 async def channel(message: Message):
-    await message.answer(
-        "📢 <b>Официальный канал Haron Visuals</b>\n\n"
-        "Подпишись, чтобы первым узнавать об обновлениях, "
-        "новых функциях и акциях!",
-        reply_markup=channel_keyboard(),
-    )
-
+    await message.answer("📢 Канал:", reply_markup=channel_keyboard())
 
 @router.message(F.text == "🟢 Поддержка")
 async def support(message: Message):
-    await message.answer(
-        "🟢 Возникли вопросы или проблемы — пиши:",
-        reply_markup=support_keyboard(),
-    )
+    await message.answer("Вопросы:", reply_markup=support_keyboard())
 
-
-# ---------- Админ-команды ----------
+@router.message(F.text == "📄 Документы")
+async def documents(message: Message):
+    await message.answer("📄 Документы:", reply_markup=legal_keyboard())
 
 @router.message(Command("genkeys"))
 async def gen_keys(message: Message):
     if not is_admin(message.from_user.id):
         return
-
     parts = (message.text or "").split()
     if len(parts) != 3 or parts[1] not in config.PLANS or not parts[2].isdigit():
-        await message.answer(
-            "Использование: <code>/genkeys план кол-во</code>\n"
-            "Планы: " + ", ".join(config.PLANS.keys()) + "\n"
-            "Пример: <code>/genkeys 30d 10</code>"
-        )
+        await message.answer("Пример: <code>/genkeys 30d 10</code>")
         return
-
-    plan, count = parts[1], min(int(parts[2]), 50)
-    keys = await db.generate_keys(plan, count, message.from_user.id)
-    plan_name = config.PLANS[plan][0]
-
-    keys_text = "\n".join(f"<code>{k}</code>" for k in keys)
-    await message.answer(
-        f"🔑 Сгенерировано {len(keys)} ключей ({plan_name}):\n\n{keys_text}\n\n"
-        f"Скопируй их в автовыдачу FunPay."
-    )
-
+    keys = await db.generate_keys(parts[1], min(int(parts[2]),50), message.from_user.id)
+    await message.answer(f"🔑 {len(keys)}:\n" + "\n".join(f"<code>{k}</code>" for k in keys))
 
 @router.message(Command("give"))
 async def give_sub(message: Message):
     if not is_admin(message.from_user.id):
         return
-
     parts = (message.text or "").split()
-    if len(parts) != 3 or parts[2] not in config.PLANS or not parts[1].lstrip("-").isdigit():
-        await message.answer(
-            "Использование: <code>/give tg_id план</code>\n"
-            "Пример: <code>/give 123456789 7d</code>"
-        )
+    if len(parts) != 3 or parts[2] not in config.PLANS:
+        await message.answer("Пример: <code>/give 123 30d</code>")
         return
-
-    target_id, plan = int(parts[1]), parts[2]
-    await db.upsert_user(target_id, None)
-    await db.grant_subscription(target_id, plan, source="contest")
-    plan_name = config.PLANS[plan][0]
-
-    await message.answer(f"✅ Выдана подписка <b>{plan_name}</b> пользователю <code>{target_id}</code>")
-
-    try:
-        await message.bot.send_message(
-            target_id,
-            f"🎉 Тебе выдана подписка <b>Haron Visuals — {plan_name}</b>!\n"
-            f"Проверь статус в «👤 Профиль».",
-        )
-    except Exception:
-        await message.answer("⚠️ Не удалось отправить уведомление (пользователь не запускал бота).")
-
+    await db.upsert_user(int(parts[1]), None)
+    await db.grant_subscription(int(parts[1]), parts[2], source="contest")
+    await message.answer("✅ Выдано")
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
     if not is_admin(message.from_user.id):
         return
+    u,a,kf,ku = await db.stats()
+    await message.answer(f"📊 Юзеров: {u}\nАктивных: {a}\nСвободно: {kf}\nЮзано: {ku}")
 
-    users, active, keys_free, keys_used = await db.stats()
-    await message.answer(
-        f"📊 <b>Статистика</b>\n\n"
-        f"👥 Пользователей: <b>{users}</b>\n"
-        f"✅ Активных подписок: <b>{active}</b>\n"
-        f"🔑 Ключей свободно: <b>{keys_free}</b>\n"
-        f"🔑 Ключей активировано: <b>{keys_used}</b>"
-    )
+@router.message(Command("post"))
+async def cmd_post(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    text = message.text.replace("/post","",1).strip()
+    if not text and message.reply_to_message:
+        text = message.reply_to_message.html_text or message.reply_to_message.text or ""
+    if not text:
+        await message.answer("Пример: <code>/post текст</code>")
+        return
+    ids = await db.get_all_tg_ids()
+    await message.answer(f"📤 {len(ids)}...")
+    ok=fail=0
+    for uid in ids:
+        try:
+            await message.bot.send_message(uid, text)
+            ok+=1
+        except Exception:
+            fail+=1
+    await message.answer(f"✅ {ok} ок, {fail} ошибок")
 
+@router.message(Command("createpromo"))
+async def create_promo_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) not in (3,4):
+        await message.answer("Пример: <code>/createpromo PRONIK20 20 100</code>")
+        return
+    try:
+        percent = int(parts[2]); max_uses = int(parts[3]) if len(parts)==4 else 0
+    except ValueError:
+        await message.answer("❌ Числа.")
+        return
+    if not 1 <= percent <= 90:
+        await message.answer("❌ 1-90.")
+        return
+    await db.create_promo(parts[1], percent, max_uses)
+    await message.answer(f"✅ <code>{parts[1].upper()}</code> -{percent}% лимит {'∞' if max_uses==0 else max_uses}")
 
-# ---------- Запуск ----------
+@router.message(Command("promos"))
+async def promos_list(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    rows = await db.list_promos()
+    if not rows:
+        await message.answer("Нет промо.")
+        return
+    txt = "🏷 <b>Промо:</b>\n\n"
+    for r in rows:
+        lim = "∞" if r["max_uses"]==0 else f"{r['used']}/{r['max_uses']}"
+        txt += f"{'✅' if r['active'] else '❌'} <code>{r['code']}</code> -{r['percent']}% {lim}\n"
+    await message.answer(txt)
+
+@router.message(Command("delpromo"))
+async def del_promo_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await message.answer("Пример: <code>/delpromo CODE</code>")
+        return
+    await db.del_promo(parts[1])
+    await message.answer("✅ Удалено.")
+
+@router.message(F.text)
+async def process_pending_vendor(message: Message):
+    if message.text.startswith("/") or message.text in ("👤 Профиль","🔑 Активировать ключ","💻 Сбросить HWID","🛒 Купить визуалы","📢 Наш канал","🟢 Поддержка","📄 Документы"):
+        return
+    pend = await db.get_pending(message.from_user.id)
+    if pend is None:
+        return
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("❌ Введи логин и пароль через пробел.\nПример: <code>mylogin mypassword</code>")
+        return
+    username, password = parts[0].replace(" ",""), parts[1].replace(" ","")
+    if not re.fullmatch(r"[A-Za-z0-9_.@+-]{3,64}", username):
+        await message.answer("❌ Логин не подходит.")
+        return
+    if len(password) < 4:
+        await message.answer("❌ Пароль мин. 4.")
+        return
+    ok = await create_vendor_account(message, username, password, pend["plan"], "rollypay")
+    if ok:
+        await db.clear_pending(message.from_user.id)
+
+async def rollypay_webhook(request: web.Request):
+    raw = await request.read()
+    timestamp = request.headers.get("X-Timestamp", "")
+    signature = request.headers.get("X-Signature", "")
+    log.info(f"WEBHOOK HEADERS: {dict(request.headers)}")
+    log.info(f"WEBHOOK BODY: {raw.decode()}")
+    if not rollypay.verify_signature(raw, timestamp, signature):
+        log.warning("RollyPay webhook: bad signature")
+        return web.Response(status=403, text="bad sign")
+    try:
+        event = json.loads(raw.decode())
+    except Exception as e:
+        log.error(f"RollyPay webhook json error: {e}")
+        return web.Response(status=400, text="bad json")
+    if event.get("event_type") == "payment.paid" and event.get("status") == "paid":
+        order_id = event.get("order_id", "")
+        row = await db.set_payment_paid(order_id)
+        if row is not None:
+            user = await db.get_user(row["tg_id"])
+            await db.upsert_user(row["tg_id"], user["username"] if user else None)
+            if row["promo_code"]:
+                try:
+                    await db.bump_promo(row["promo_code"])
+                except Exception:
+                    pass
+            await db.set_pending(row["tg_id"], row["plan"])
+            try:
+                await request.app["bot"].send_message(
+                    row["tg_id"],
+                    f"✅ Оплата прошла! <b>{config.PLANS[row['plan']][0]}</b>\n\n"
+                    f"Теперь введи логин и пароль через пробел.\n"
+                    f"Пример: <code>mylogin mypassword</code>"
+                )
+            except Exception as e:
+                log.error(f"Failed to send message to {row['tg_id']}: {e}")
+    return web.Response(text="OK")
 
 async def on_startup():
     await db.init()
-    log.info("База данных инициализирована.")
-
+    log.info("DB ok")
 
 async def main():
-    bot = Bot(
-        token=config.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
-    
-    # Подключаем middleware для проверки подписки
     dp.message.middleware(SubscriptionMiddleware())
     dp.callback_query.middleware(SubscriptionMiddleware())
-    
     dp.include_router(router)
     dp.startup.register(on_startup)
-
-    log.info("Бот запущен и ожидает сообщения...")
+    app = web.Application()
+    app["bot"] = bot
+    app.router.add_post("/webhooks/rollypay", rollypay_webhook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", config.PORT).start()
     await dp.start_polling(bot, drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
