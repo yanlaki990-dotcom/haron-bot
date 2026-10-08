@@ -139,7 +139,10 @@ async def create_vendor_account(message: Message, username: str, password: str, 
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub_callback(call: CallbackQuery, state: FSMContext):
-    await call.message.delete()
+    try:
+        await call.message.delete()
+    except Exception as e:
+        log.warning(f"Не удалось удалить сообщение: {e}")
     await call.message.answer("✅ Спасибо! Нажми /start")
     await call.answer()
 
@@ -417,27 +420,29 @@ async def rollypay_webhook(request: web.Request):
     except Exception as e:
         log.error(f"RollyPay webhook json error: {e}")
         return web.Response(status=400, text="bad json")
+    
     if event.get("event_type") == "payment.paid" and event.get("status") == "paid":
         order_id = event.get("order_id", "")
         row = await db.set_payment_paid(order_id)
         if row is not None:
-            user = await db.get_user(row["tg_id"])
-            await db.upsert_user(row["tg_id"], user["username"] if user else None)
             if row["promo_code"]:
                 try:
                     await db.bump_promo(row["promo_code"])
                 except Exception:
                     pass
             await db.set_pending(row["tg_id"], row["plan"])
-            try:
-                await request.app["bot"].send_message(
+            
+            # Отправляем сообщение в фоне, чтобы не задерживать ответ RollyPay
+            asyncio.create_task(
+                request.app["bot"].send_message(
                     row["tg_id"],
                     f"✅ Оплата прошла! <b>{config.PLANS[row['plan']][0]}</b>\n\n"
                     f"Теперь введи логин и пароль через пробел.\n"
                     f"Пример: <code>mylogin mypassword</code>"
                 )
-            except Exception as e:
-                log.error(f"Failed to send message to {row['tg_id']}: {e}")
+            )
+    
+    # Отвечаем RollyPay сразу, чтобы избежать повторных доставок
     return web.Response(text="OK")
 
 async def on_startup():
@@ -456,7 +461,11 @@ async def main():
     app.router.add_post("/webhooks/rollypay", rollypay_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
+    
+    # Логируем порт, чтобы точно знать, куда стучится Bothost
+    log.info(f"Web server started on port {config.PORT}")
     await web.TCPSite(runner, "0.0.0.0", config.PORT).start()
+    
     await dp.start_polling(bot, drop_pending_updates=True)
 
 if __name__ == "__main__":
