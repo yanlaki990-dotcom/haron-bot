@@ -43,7 +43,13 @@ class SubscriptionMiddleware(BaseMiddleware):
         return
 
 def main_menu():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="👤 Профиль")],[KeyboardButton(text="🔑 Активировать ключ")],[KeyboardButton(text="💻 Сбросить HWID"),KeyboardButton(text="🛒 Купить визуалы")],[KeyboardButton(text="📢 Наш канал"),KeyboardButton(text="🟢 Поддержка")],[KeyboardButton(text="📄 Документы")]], resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="👤 Профиль")],
+        [KeyboardButton(text="🔑 Активировать ключ")],
+        [KeyboardButton(text="💻 Сбросить HWID"), KeyboardButton(text="🛒 Купить визуалы")],
+        [KeyboardButton(text="📢 Наш канал"), KeyboardButton(text="🟢 Поддержка")],
+        [KeyboardButton(text="📄 Документы")]
+    ], resize_keyboard=True)
 
 def buy_tariffs_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"📅 30 Дней ({config.PRICES['30d']}р)", callback_data="buy_30d")],[InlineKeyboardButton(text=f"📅 90 Дней ({config.PRICES['90d']}р)", callback_data="buy_90d")],[InlineKeyboardButton(text=f"♾️ Навсегда ({config.PRICES['forever']}р)", callback_data="buy_forever")]])
@@ -108,34 +114,33 @@ async def send_invoice(chat: Message, tg_id: int, plan: str, promo_code: str | N
     await chat.answer(txt, reply_markup=kb)
 
 async def create_vendor_account(message: Message, username: str, password: str, plan: str, source: str):
-    payload = {"username": username, "password": password, "lifetime": True} if plan=="forever" else {"username": username, "password": password, "days": get_days_for_plan(plan)}
-    headers = {"X-Vendor-Key": config.VENDOR_API_KEY, "Content-Type": "application/json"}
+    """Сохраняет аккаунт в Neon. Никаких внешних API."""
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(config.VENDOR_API_URL, json=payload, headers=headers) as r:
-                if r.status != 200:
-                    await message.answer(f"❌ Ошибка лицензирования: {r.status}. Пиши в поддержку.")
-                    return False
-                result = await r.json()
-    except Exception as e:
-        await message.answer(f"❌ Связь: {e}")
-        return False
-    if result.get("status") == "ok":
-        exp = result.get("expiresAt")
-        exp_d = datetime.fromtimestamp(exp/1000).strftime("%d.%m.%Y %H:%M") if exp else "бессрочно"
         await db.grant_subscription(message.from_user.id, plan, source=source)
         await db.set_vendor_username(message.from_user.id, username)
+        await db.set_password(message.from_user.id, password)
+    except Exception as e:
+        log.error(f"save account failed for {message.from_user.id}: {e}")
+        await message.answer(f"❌ Ошибка сохранения: {e}")
+        return False
 
-        # Сохраняем пароль в Neon (открытым текстом)
-        try:
-            await db.set_password(message.from_user.id, password)
-        except Exception as e:
-            log.error(f"save password failed for {message.from_user.id}: {e}")
+    sub = await db.get_active_subscription(message.from_user.id)
+    if sub and sub["expires_at"]:
+        exp_d = sub["expires_at"].strftime("%d.%m.%Y %H:%M")
+    else:
+        exp_d = "бессрочно"
 
-        await message.answer(f"✅ Аккаунт в SecureFabric создан!\n\n👤 Логин: <code>{username}</code>\n🔑 Пароль: <code>{password}</code>\n🎁 Тариф: <b>{config.PLANS[plan][0]}</b>\n⏳ До: {exp_d}\n\n📥 Скачать лаунчер: {config.LOADER_URL}\n\nСохрани логин и пароль.", reply_markup=main_menu())
-        return True
-    await message.answer(f"❌ SecureFabric: {result.get('code','UNKNOWN')}")
-    return False
+    await message.answer(
+        f"✅ Аккаунт создан!\n\n"
+        f"👤 Логин: <code>{username}</code>\n"
+        f"🔑 Пароль: <code>{password}</code>\n"
+        f"🎁 Тариф: <b>{config.PLANS[plan][0]}</b>\n"
+        f"⏳ До: {exp_d}\n\n"
+        f"📥 Скачать лаунчер: {config.LOADER_URL}\n\n"
+        f"Сохрани логин и пароль.",
+        reply_markup=main_menu()
+    )
+    return True
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub_callback(call: CallbackQuery, state: FSMContext):
@@ -420,7 +425,7 @@ async def rollypay_webhook(request: web.Request):
     except Exception as e:
         log.error(f"RollyPay webhook json error: {e}")
         return web.Response(status=400, text="bad json")
-    
+
     if event.get("event_type") == "payment.paid" and event.get("status") == "paid":
         order_id = event.get("order_id", "")
         row = await db.set_payment_paid(order_id)
@@ -431,8 +436,6 @@ async def rollypay_webhook(request: web.Request):
                 except Exception:
                     pass
             await db.set_pending(row["tg_id"], row["plan"])
-            
-            # Отправляем сообщение в фоне, чтобы не задерживать ответ RollyPay
             asyncio.create_task(
                 request.app["bot"].send_message(
                     row["tg_id"],
@@ -441,8 +444,6 @@ async def rollypay_webhook(request: web.Request):
                     f"Пример: <code>mylogin mypassword</code>"
                 )
             )
-    
-    # Отвечаем RollyPay сразу, чтобы избежать повторных доставок
     return web.Response(text="OK")
 
 async def on_startup():
@@ -461,11 +462,10 @@ async def main():
     app.router.add_post("/webhooks/rollypay", rollypay_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    # Логируем порт, чтобы точно знать, куда стучится Bothost
+
     log.info(f"Web server started on port {config.PORT}")
     await web.TCPSite(runner, "0.0.0.0", config.PORT).start()
-    
+
     await dp.start_polling(bot, drop_pending_updates=True)
 
 if __name__ == "__main__":
