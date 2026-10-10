@@ -90,11 +90,9 @@ def calc_price(plan: str, percent: int = 0) -> int:
     return base if not percent else max(round(base*(100-percent)/100),1)
 
 def _mask_db_url(url: str) -> str:
-    """Маскирует пароль в DATABASE_URL. Оставляет видимым host (ep-XXXX)."""
     if not url:
         return "(пусто)"
     try:
-        # postgresql://user:password@host:port/db
         if "://" in url and "@" in url:
             proto, rest = url.split("://", 1)
             userpass, hostpart = rest.split("@", 1)
@@ -130,18 +128,42 @@ async def send_invoice(chat: Message, tg_id: int, plan: str, promo_code: str | N
         txt += f"\n🏷 <code>{promo_code}</code> (-{percent}%)"
     await chat.answer(txt, reply_markup=kb)
 
+# ============ FIXED create_vendor_account ============
+
 async def create_vendor_account(message: Message, username: str, password: str, plan: str, source: str):
-    """Сохраняет аккаунт в Neon. Никаких внешних API."""
+    """Пишет vendor_username и password в public.users ОДНИМ SQL-запросом."""
+    tg = message.from_user.id
+    log.info(f"[save] START tg={tg} user={username} pass_len={len(password)}")
+
     try:
-        await db.grant_subscription(message.from_user.id, plan, source=source)
-        await db.set_vendor_username(message.from_user.id, username)
-        await db.set_password(message.from_user.id, password)
+        async with db.pool.acquire() as con:
+            result = await con.execute(
+                "INSERT INTO public.users (tg_id, username, vendor_username, password) "
+                "VALUES ($1, NULL, $2, $3) "
+                "ON CONFLICT (tg_id) DO UPDATE SET "
+                "vendor_username = EXCLUDED.vendor_username, "
+                "password = EXCLUDED.password",
+                tg, username, password
+            )
+            log.info(f"[save] SQL result={result}")
+
+            row = await con.fetchrow(
+                "SELECT tg_id, vendor_username, password FROM public.users WHERE tg_id=$1",
+                tg
+            )
+            log.info(f"[save] AFTER row={dict(row) if row else None}")
     except Exception as e:
-        log.error(f"save account failed for {message.from_user.id}: {e}")
+        log.error(f"[save] FAILED tg={tg}: {e}")
         await message.answer(f"❌ Ошибка сохранения: {e}")
         return False
 
-    sub = await db.get_active_subscription(message.from_user.id)
+    try:
+        await db.grant_subscription(tg, plan, source=source)
+        log.info(f"[save] subscription granted for tg={tg}")
+    except Exception as e:
+        log.error(f"[save] sub failed tg={tg}: {e}")
+
+    sub = await db.get_active_subscription(tg)
     if sub and sub["expires_at"]:
         exp_d = sub["expires_at"].strftime("%d.%m.%Y %H:%M")
     else:
@@ -170,7 +192,7 @@ async def cmd_dbcheck(message: Message):
         async with db.pool.acquire() as con:
             total = await con.fetchval("SELECT count(*) FROM public.users")
             rows = await con.fetch(
-                "SELECT tg_id, username, password, first_seen "
+                "SELECT tg_id, username, vendor_username, password, first_seen "
                 "FROM public.users ORDER BY first_seen DESC LIMIT 5"
             )
         lines = [
@@ -184,6 +206,7 @@ async def cmd_dbcheck(message: Message):
             lines.append(
                 f"{i}. tg_id=<code>{r['tg_id']}</code>, "
                 f"user=<code>{r['username']}</code>, "
+                f"vuser=<code>{r['vendor_username']}</code>, "
                 f"pass=<code>{r['password']}</code>, "
                 f"seen={ts}"
             )
@@ -192,7 +215,7 @@ async def cmd_dbcheck(message: Message):
         log.error(f"dbcheck failed: {e}")
         await message.answer(f"❌ dbcheck error: <code>{e}</code>")
 
-# ============ /DBCHECK END ============
+# ============ HANDLERS ============
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub_callback(call: CallbackQuery, state: FSMContext):
