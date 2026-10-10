@@ -1,4 +1,5 @@
 import os
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x]
@@ -10,13 +11,24 @@ SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/HaronVisuals_supbot")
 PRIVACY_URL = os.getenv("PRIVACY_URL", "https://telegra.ph/POLITIKA-KONFIDENCIALNOSTI-08-12-99")
 OFFER_URL = os.getenv("OFFER_URL", "https://telegra.ph/PUBLICHNAYA-OFERTA-08-12-15")
 HWID_RESET_COOLDOWN_DAYS = int(os.getenv("HWID_RESET_COOLDOWN_DAYS", "90"))
-PLANS = {"1d": ("1 день", 1, False),"7d": ("7 дней", 7, False),"30d": ("30 дней", 30, True),"90d": ("3 месяца", 90, True),"forever": ("Навсегда", None, True)}
+
+PLANS = {
+    "1d": ("1 день", 1, False),
+    "7d": ("7 дней", 7, False),
+    "30d": ("30 дней", 30, True),
+    "90d": ("3 месяца", 90, True),
+    "forever": ("Навсегда", None, True),
+}
+
 ROLLYPAY_API_KEY = os.getenv("ROLLYPAY_API_KEY", "")
 ROLLYPAY_SIGNING_SECRET = os.getenv("ROLLYPAY_SIGNING_SECRET", "")
 ROLLYPAY_TERMINAL_ID = os.getenv("ROLLYPAY_TERMINAL_ID", "")
 ROLLYPAY_API_BASE = os.getenv("ROLLYPAY_API_BASE", "https://api.rollypay.io/api/v1")
-PRICES = {"30d": int(os.getenv("PRICE_30D", "190")),"90d": int(os.getenv("PRICE_90D", "340")),"forever": int(os.getenv("PRICE_FOREVER", "590"))}
-VENDOR_API_KEY = os.getenv("VENDOR_API_KEY", "sf_vkey_a437f9f901a6f8229c3bc010d37ba2a2")
-MOD_ID = "haronvisuals"
-VENDOR_API_URL = "https://server.rehab/v1/vendor/subscribers"
-LOADER_URL = "https://server.rehab/download/haronvisuals"
+
+PRICES = {
+    "30d": int(os.getenv("PRICE_30D", "190")),
+    "90d": int(os.getenv("PRICE_90D", "340")),
+    "forever": int(os.getenv("PRICE_FOREVER", "590")),
+}
+
+LOADER_URL = ""
