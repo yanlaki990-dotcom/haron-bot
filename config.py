@@ -31,4 +31,4 @@ PRICES = {
     "forever": int(os.getenv("PRICE_FOREVER", "590")),
 }
 
-LOADER_URL = "https://github.com/HaronVisuals/Loader/releases/latest/download/loader.exe"
+LOADER_URL = "https://github.com/HaronVisuals/Loader/releases/download/v0.1.2/HaronVisuals.Loader.exe"
