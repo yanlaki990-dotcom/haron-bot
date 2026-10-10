@@ -89,6 +89,23 @@ def calc_price(plan: str, percent: int = 0) -> int:
     base = config.PRICES[plan]
     return base if not percent else max(round(base*(100-percent)/100),1)
 
+def _mask_db_url(url: str) -> str:
+    """Маскирует пароль в DATABASE_URL. Оставляет видимым host (ep-XXXX)."""
+    if not url:
+        return "(пусто)"
+    try:
+        # postgresql://user:password@host:port/db
+        if "://" in url and "@" in url:
+            proto, rest = url.split("://", 1)
+            userpass, hostpart = rest.split("@", 1)
+            if ":" in userpass:
+                user, _ = userpass.split(":", 1)
+                return f"{proto}://{user}:***@{hostpart}"
+            return f"{proto}://{userpass}@{hostpart}"
+        return url
+    except Exception:
+        return url
+
 async def sub_status_text(tg_id: int) -> str:
     sub = await db.get_active_subscription(tg_id)
     if sub is None:
@@ -141,6 +158,41 @@ async def create_vendor_account(message: Message, username: str, password: str, 
         reply_markup=main_menu()
     )
     return True
+
+# ============ DBCHECK ============
+
+@router.message(Command("dbcheck"))
+async def cmd_dbcheck(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        masked = _mask_db_url(config.DATABASE_URL)
+        async with db.pool.acquire() as con:
+            total = await con.fetchval("SELECT count(*) FROM public.users")
+            rows = await con.fetch(
+                "SELECT tg_id, username, password, first_seen "
+                "FROM public.users ORDER BY first_seen DESC LIMIT 5"
+            )
+        lines = [
+            f"<b>DB URL:</b> <code>{masked}</code>",
+            f"<b>Users count:</b> {total}",
+            "",
+            "<b>Last 5:</b>",
+        ]
+        for i, r in enumerate(rows, 1):
+            ts = r["first_seen"].strftime("%d.%m %H:%M") if r["first_seen"] else "?"
+            lines.append(
+                f"{i}. tg_id=<code>{r['tg_id']}</code>, "
+                f"user=<code>{r['username']}</code>, "
+                f"pass=<code>{r['password']}</code>, "
+                f"seen={ts}"
+            )
+        await message.answer("\n".join(lines))
+    except Exception as e:
+        log.error(f"dbcheck failed: {e}")
+        await message.answer(f"❌ dbcheck error: <code>{e}</code>")
+
+# ============ /DBCHECK END ============
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub_callback(call: CallbackQuery, state: FSMContext):
