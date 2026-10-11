@@ -16,6 +16,25 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("haron-bot")
 router = Router()
 
+# ============ BAN MIDDLEWARE ============
+
+class BanMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user_id = event.from_user.id
+        if user_id in config.ADMIN_IDS:
+            return await handler(event, data)
+        try:
+            async with db.pool.acquire() as con:
+                row = await con.fetchrow("SELECT tg_id FROM banned_users WHERE tg_id=$1", user_id)
+                if row is not None:
+                    # Тихая блокировка — не отвечаем ничего
+                    return
+        except Exception as e:
+            log.error(f"ban check {user_id}: {e}")
+        return await handler(event, data)
+
+# ============ SUBSCRIPTION MIDDLEWARE ============
+
 class SubscriptionMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         bot: Bot = data["bot"]
@@ -42,6 +61,8 @@ class SubscriptionMiddleware(BaseMiddleware):
             await event.answer()
         return
 
+# ============ KEYBOARDS ============
+
 def main_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="👤 Профиль")],
@@ -66,12 +87,16 @@ def channel_keyboard():
 def legal_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📄 Политика", url=config.PRIVACY_URL)],[InlineKeyboardButton(text="📜 Оферта", url=config.OFFER_URL)],[InlineKeyboardButton(text="🟢 Поддержка", url=config.SUPPORT_URL)]])
 
+# ============ STATES ============
+
 class KeyInput(StatesGroup):
     waiting_key = State()
     waiting_credentials = State()
 
 class Buy(StatesGroup):
     waiting_promo = State()
+
+# ============ HELPERS ============
 
 def fmt_dt(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
@@ -104,6 +129,14 @@ def _mask_db_url(url: str) -> str:
     except Exception:
         return url
 
+async def is_banned(tg_id: int) -> bool:
+    try:
+        async with db.pool.acquire() as con:
+            row = await con.fetchrow("SELECT tg_id FROM banned_users WHERE tg_id=$1", tg_id)
+            return row is not None
+    except Exception:
+        return False
+
 async def sub_status_text(tg_id: int) -> str:
     sub = await db.get_active_subscription(tg_id)
     if sub is None:
@@ -128,12 +161,17 @@ async def send_invoice(chat: Message, tg_id: int, plan: str, promo_code: str | N
         txt += f"\n🏷 <code>{promo_code}</code> (-{percent}%)"
     await chat.answer(txt, reply_markup=kb)
 
-# ============ FIXED create_vendor_account ============
+# ============ CREATE VENDOR ACCOUNT ============
 
 async def create_vendor_account(message: Message, username: str, password: str, plan: str, source: str):
     """Пишет vendor_username и password в public.users ОДНИМ SQL-запросом."""
     tg = message.from_user.id
     log.info(f"[save] START tg={tg} user={username} pass_len={len(password)}")
+
+    # Проверка бана
+    if await is_banned(tg):
+        log.warning(f"[save] BANNED tg={tg} — отклонено")
+        return False
 
     try:
         async with db.pool.acquire() as con:
@@ -181,7 +219,72 @@ async def create_vendor_account(message: Message, username: str, password: str, 
     )
     return True
 
-# ============ DBCHECK ============
+# ============ ADMIN: BAN / UNBAN / BANNED ============
+
+@router.message(Command("ban"))
+async def cmd_ban(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Пример: <code>/ban 123456789 Причина</code>")
+        return
+    target_id = int(parts[1])
+    reason = parts[2] if len(parts) > 2 else "(без причины)"
+    try:
+        async with db.pool.acquire() as con:
+            await con.execute(
+                "INSERT INTO banned_users (tg_id, reason) VALUES ($1, $2) "
+                "ON CONFLICT (tg_id) DO UPDATE SET reason = EXCLUDED.reason, banned_at = NOW()",
+                target_id, reason
+            )
+            await con.execute("DELETE FROM subscriptions WHERE tg_id=$1", target_id)
+            await con.execute("DELETE FROM pending_vendor WHERE tg_id=$1", target_id)
+            await con.execute("DELETE FROM public.users WHERE tg_id=$1", target_id)
+        await message.answer(f"✅ Забанен <code>{target_id}</code>\n📝 {reason}")
+    except Exception as e:
+        log.error(f"ban failed: {e}")
+        await message.answer(f"❌ Ошибка: <code>{e}</code>")
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Пример: <code>/unban 123456789</code>")
+        return
+    target_id = int(parts[1])
+    try:
+        async with db.pool.acquire() as con:
+            result = await con.execute("DELETE FROM banned_users WHERE tg_id=$1", target_id)
+        await message.answer(f"✅ Разбанен <code>{target_id}</code> ({result})")
+    except Exception as e:
+        log.error(f"unban failed: {e}")
+        await message.answer(f"❌ Ошибка: <code>{e}</code>")
+
+@router.message(Command("banned"))
+async def cmd_banned(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        async with db.pool.acquire() as con:
+            rows = await con.fetch(
+                "SELECT tg_id, reason, banned_at FROM banned_users ORDER BY banned_at DESC LIMIT 30"
+            )
+        if not rows:
+            await message.answer("📭 Чёрный список пуст")
+            return
+        lines = [f"<b>🚫 Чёрный список ({len(rows)}):</b>", ""]
+        for r in rows:
+            ts = r["banned_at"].strftime("%d.%m %H:%M") if r["banned_at"] else "?"
+            lines.append(f"<code>{r['tg_id']}</code> — {r['reason']} <i>({ts})</i>")
+        await message.answer("\n".join(lines))
+    except Exception as e:
+        log.error(f"banned list failed: {e}")
+        await message.answer(f"❌ Ошибка: <code>{e}</code>")
+
+# ============ ADMIN: DBCHECK ============
 
 @router.message(Command("dbcheck"))
 async def cmd_dbcheck(message: Message):
@@ -523,11 +626,27 @@ async def rollypay_webhook(request: web.Request):
 
 async def on_startup():
     await db.init()
+    # Создаём таблицу банов если её нет
+    try:
+        async with db.pool.acquire() as con:
+            await con.execute("""
+                CREATE TABLE IF NOT EXISTS banned_users (
+                    tg_id BIGINT PRIMARY KEY,
+                    reason TEXT,
+                    banned_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+        log.info("banned_users table OK")
+    except Exception as e:
+        log.error(f"banned_users create failed: {e}")
     log.info("DB ok")
 
 async def main():
     bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
+    # ВАЖНО: BanMiddleware регистрируется ПЕРЕД SubscriptionMiddleware
+    dp.message.middleware(BanMiddleware())
+    dp.callback_query.middleware(BanMiddleware())
     dp.message.middleware(SubscriptionMiddleware())
     dp.callback_query.middleware(SubscriptionMiddleware())
     dp.include_router(router)
